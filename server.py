@@ -5,6 +5,7 @@ import random
 import asyncio
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.server import TransportSecuritySettings
 from starlette.responses import JSONResponse
 
 # -----------------------------------------------------------------------------
@@ -18,6 +19,33 @@ if not MCP_API_KEY:
         file=sys.stderr
     )
     sys.exit(1)
+
+# Railway public hostname for transport security allowlist.
+# Set RAILWAY_PUBLIC_HOST to e.g. "telephone-mcp-remote-production-e613.up.railway.app"
+RAILWAY_PUBLIC_HOST = os.environ.get(
+    "RAILWAY_PUBLIC_HOST",
+    "telephone-mcp-remote-production-e613.up.railway.app"
+)
+
+# -----------------------------------------------------------------------------
+# Transport Security Settings
+# -----------------------------------------------------------------------------
+_transport_security = TransportSecuritySettings(
+    enable_dns_rebinding_protection=True,
+    allowed_hosts=[
+        RAILWAY_PUBLIC_HOST,
+        f"{RAILWAY_PUBLIC_HOST}:*",
+        "localhost",
+        "localhost:*",
+        "127.0.0.1",
+        "127.0.0.1:*",
+    ],
+    allowed_origins=[
+        f"https://{RAILWAY_PUBLIC_HOST}",
+        "http://localhost:*",
+        "http://127.0.0.1:*",
+    ],
+)
 
 # -----------------------------------------------------------------------------
 # ASGI Bearer Authentication Middleware
@@ -40,25 +68,25 @@ class BearerAuthASGIMiddleware:
                 if not auth_bytes:
                     await self._send_401(send, "Missing Authorization header")
                     return
-                
+
                 try:
                     auth_str = auth_bytes.decode("utf-8")
                 except Exception:
                     await self._send_401(send, "Invalid headers encoding")
                     return
-                
+
                 parts = auth_str.split()
                 if len(parts) != 2 or parts[0].lower() != "bearer":
                     await self._send_401(
-                        send, 
+                        send,
                         "Invalid Authorization header format. Expected 'Bearer <key>'"
                     )
                     return
-                
+
                 if parts[1] != MCP_API_KEY:
                     await self._send_401(send, "Invalid API key")
                     return
-        
+
         await self.app(scope, receive, send)
 
     async def _send_401(self, send, detail):
@@ -81,12 +109,13 @@ class BearerAuthASGIMiddleware:
 # -----------------------------------------------------------------------------
 mcp = FastMCP(
     "Telephone Translator",
-    instructions="A spec-compliant Remote MCP server for translations and text formatting."
+    instructions="A spec-compliant Remote MCP server for translations and text formatting.",
+    transport_security=_transport_security,
 )
 
 LANGUAGES = [
-    'es', 'fr', 'de', 'it', 'ja', 'ko', 'zh-CN', 'ru', 'pt', 'ar', 
-    'tr', 'nl', 'pl', 'fi', 'el', 'sv', 'hi', 'da', 'no', 'vi', 'he'
+    "es", "fr", "de", "it", "ja", "ko", "zh-CN", "ru", "pt", "ar",
+    "tr", "nl", "pl", "fi", "el", "sv", "hi", "da", "no", "vi", "he"
 ]
 
 SPELLING_MAP = {
@@ -113,19 +142,19 @@ async def translate_once(client: httpx.AsyncClient, text: str, from_lang: str, t
         "dt": "t",
         "q": text
     }
-    
+
     try:
         response = await client.get(
-            url, 
-            params=params, 
+            url,
+            params=params,
             headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             },
             timeout=10.0
         )
         if response.status_code != 200:
             return text
-            
+
         res_data = response.json()
         translated_text = ""
         if res_data and isinstance(res_data, list) and len(res_data) > 0 and isinstance(res_data[0], list):
@@ -138,7 +167,7 @@ async def translate_once(client: httpx.AsyncClient, text: str, from_lang: str, t
 
 async def telephone_translate_helper(text: str, rounds: int, return_language: str, preserve_quotes: bool) -> str:
     quotes = []
-    
+
     if preserve_quotes:
         def replace_quote(match):
             quotes.append(match.group(0))
@@ -146,35 +175,34 @@ async def telephone_translate_helper(text: str, rounds: int, return_language: st
         placeholder_text = re.sub(r'"([^"]*)"', replace_quote, text)
     else:
         placeholder_text = text
-        
+
     current_text = placeholder_text
     current_lang = "auto"
-    
+
     async with httpx.AsyncClient() as client:
-        # Perform rounds - 1 intermediate translations
-        for i in range(rounds - 1):
+        for _ in range(rounds - 1):
             choices = [l for l in LANGUAGES if l != current_lang and l != return_language]
             if not choices:
                 choices = LANGUAGES
             next_lang = random.choice(choices)
-            
+
             current_text = await translate_once(client, current_text, current_lang, next_lang)
             current_lang = next_lang
-            await asyncio.sleep(0.05) # Polite delay
-            
-        # Final round back to return_language
+            await asyncio.sleep(0.05)
+
         current_text = await translate_once(client, current_text, current_lang, return_language)
-        
-    # Restore quotes if applicable
+
     if preserve_quotes and quotes:
         restore_pattern = re.compile(r'__\s*QUOTE\s*_\s*(\d+)\s*__', re.IGNORECASE)
+
         def restore_quote(match):
             idx = int(match.group(1))
             if idx < len(quotes):
                 return quotes[idx]
             return match.group(0)
+
         current_text = restore_pattern.sub(restore_quote, current_text)
-        
+
     return current_text
 
 def format_text_helper(
@@ -184,19 +212,17 @@ def format_text_helper(
     indent_paragraphs: bool,
     fix_spelling: bool
 ) -> str:
-    # 1. Remove double spaces
     if remove_double_spaces:
-        text = re.sub(r' {2,}', ' ', text)
-        
-    # 2. Convert curly quotes & backticks
+        text = re.sub(r" {2,}", " ", text)
+
     if straighten_quotes:
         text = text.replace("“", '"').replace("”", '"')
         text = text.replace("‘", "'").replace("’", "'").replace("`", "'")
-        
-    # 3. Fix common spelling errors
+
     if fix_spelling:
         for wrong, right in SPELLING_MAP.items():
-            pattern = re.compile(rf'\b{wrong}\b', re.IGNORECASE)
+            pattern = re.compile(rf"\b{wrong}\b", re.IGNORECASE)
+
             def replace(match):
                 word = match.group(0)
                 if word.isupper():
@@ -204,21 +230,21 @@ def format_text_helper(
                 elif word[0].isupper():
                     return right.capitalize()
                 return right
+
             text = pattern.sub(replace, text)
-            
-    # 4. Indent paragraphs (done last so spacing is not collapsed by remove_double_spaces)
+
     if indent_paragraphs:
-        lines = text.split('\n')
+        lines = text.split("\n")
         formatted_lines = []
         for idx, line in enumerate(lines):
             if idx == 0 and line.strip():
                 formatted_lines.append("    " + line)
-            elif idx > 0 and line.strip() and not lines[idx-1].strip():
+            elif idx > 0 and line.strip() and not lines[idx - 1].strip():
                 formatted_lines.append("    " + line)
             else:
                 formatted_lines.append(line)
-        text = '\n'.join(formatted_lines)
-        
+        text = "\n".join(formatted_lines)
+
     return text
 
 # -----------------------------------------------------------------------------
@@ -232,13 +258,8 @@ async def telephone_translate(
     preserve_quotes: bool = True
 ) -> str:
     """
-    Send text through multiple random translation steps to deliberately distort/mangle it before returning the final translation.
-
-    Args:
-        text: The text to translate.
-        rounds: Number of translation rounds (default: 8, clamp 5..50).
-        return_language: Final target language (default: en).
-        preserve_quotes: Whether to preserve double-quoted text using placeholders.
+    Send text through multiple random translation steps to deliberately
+    distort/mangle it before returning the final translation.
     """
     clamped_rounds = max(5, min(50, rounds))
     return await telephone_translate_helper(
@@ -257,14 +278,8 @@ def format_text(
     fix_spelling: bool = False
 ) -> str:
     """
-    Format text by removing extra spaces, converting quotes, indenting paragraphs, and fixing common spelling mistakes.
-
-    Args:
-        text: The text to format.
-        remove_double_spaces: Remove extra spaces.
-        straighten_quotes: Convert curly quotes to straight quotes.
-        indent_paragraphs: Indent paragraphs with 4 spaces.
-        fix_spelling: Fix common spelling errors.
+    Format text by removing extra spaces, converting quotes, indenting
+    paragraphs, and fixing common spelling mistakes.
     """
     return format_text_helper(
         text=text,
@@ -277,10 +292,8 @@ def format_text(
 # -----------------------------------------------------------------------------
 # Streamable HTTP App Exposure & Health Check Route
 # -----------------------------------------------------------------------------
-# Create the official Streamable HTTP Starlette ASGI application
 base_app = mcp.streamable_http_app()
 
-# Register health check route at root / on the base application
 async def health(request):
     return JSONResponse({
         "status": "healthy",
@@ -290,5 +303,4 @@ async def health(request):
 
 base_app.add_route("/", health, methods=["GET"])
 
-# Wrap with our custom security middleware to protect all /mcp endpoints
 app = BearerAuthASGIMiddleware(base_app)
