@@ -4,7 +4,8 @@ import re
 import random
 import asyncio
 import httpx
-from fastapi import FastAPI, Request, HTTPException, status
+from mcp.server.fastmcp import FastMCP
+from starlette.responses import JSONResponse
 
 # -----------------------------------------------------------------------------
 # Startup configuration & Fail-Fast check
@@ -18,20 +19,76 @@ if not MCP_API_KEY:
     )
     sys.exit(1)
 
-# Initialize FastAPI App
-app = FastAPI(
-    title="Telephone Translator Remote MCP Server",
-    description="A minimal Python remote Model Context Protocol (MCP) server.",
-    version="1.0.0"
+# -----------------------------------------------------------------------------
+# ASGI Bearer Authentication Middleware
+# -----------------------------------------------------------------------------
+class BearerAuthASGIMiddleware:
+    """
+    Standard ASGI middleware that checks for 'Authorization: Bearer <key>'
+    on all incoming paths starting with '/mcp'.
+    Ensures safe handling of Starlette chunked/streaming SSE responses.
+    """
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            path = scope.get("path", "")
+            if path.startswith("/mcp"):
+                headers = dict(scope.get("headers", []))
+                auth_bytes = headers.get(b"authorization")
+                if not auth_bytes:
+                    await self._send_401(send, "Missing Authorization header")
+                    return
+                
+                try:
+                    auth_str = auth_bytes.decode("utf-8")
+                except Exception:
+                    await self._send_401(send, "Invalid headers encoding")
+                    return
+                
+                parts = auth_str.split()
+                if len(parts) != 2 or parts[0].lower() != "bearer":
+                    await self._send_401(
+                        send, 
+                        "Invalid Authorization header format. Expected 'Bearer <key>'"
+                    )
+                    return
+                
+                if parts[1] != MCP_API_KEY:
+                    await self._send_401(send, "Invalid API key")
+                    return
+        
+        await self.app(scope, receive, send)
+
+    async def _send_401(self, send, detail):
+        response_body = f'{{"detail":"{detail}"}}'.encode("utf-8")
+        await send({
+            "type": "http.response.start",
+            "status": 401,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(response_body)).encode("ascii")),
+            ],
+        })
+        await send({
+            "type": "http.response.body",
+            "body": response_body,
+        })
+
+# -----------------------------------------------------------------------------
+# Initialize FastMCP Server & Tools
+# -----------------------------------------------------------------------------
+mcp = FastMCP(
+    "Telephone Translator",
+    instructions="A spec-compliant Remote MCP server for translations and text formatting."
 )
 
-# Supported translation languages for the telephone_translate tool
 LANGUAGES = [
     'es', 'fr', 'de', 'it', 'ja', 'ko', 'zh-CN', 'ru', 'pt', 'ar', 
     'tr', 'nl', 'pl', 'fi', 'el', 'sv', 'hi', 'da', 'no', 'vi', 'he'
 ]
 
-# Spelling correction map for format_text
 SPELLING_MAP = {
     "teh": "the",
     "recieve": "receive",
@@ -45,34 +102,9 @@ SPELLING_MAP = {
 }
 
 # -----------------------------------------------------------------------------
-# Helper logic
+# Tool Helper Logic
 # -----------------------------------------------------------------------------
-async def verify_auth(auth_header: str):
-    """
-    Validates that the Authorization header matches the expected 'Bearer <token>'.
-    Raises HTTP 401 on missing or incorrect auth.
-    """
-    if not auth_header:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing Authorization header"
-        )
-    parts = auth_header.split()
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid Authorization header format. Expected 'Bearer <key>'"
-        )
-    if parts[1] != MCP_API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key"
-        )
-
 async def translate_once(client: httpx.AsyncClient, text: str, from_lang: str, to_lang: str) -> str:
-    """
-    Translates a block of text using the lightweight Google Translate endpoint.
-    """
     url = "https://translate.googleapis.com/translate_a/single"
     params = {
         "client": "gtx",
@@ -102,13 +134,9 @@ async def translate_once(client: httpx.AsyncClient, text: str, from_lang: str, t
                     translated_text += part[0]
         return translated_text if translated_text else text
     except Exception:
-        # Fallback gracefully to input text in case of API or network error
         return text
 
 async def telephone_translate_helper(text: str, rounds: int, return_language: str, preserve_quotes: bool) -> str:
-    """
-    Translates text sequentially through multiple random languages and back to return_language.
-    """
     quotes = []
     
     if preserve_quotes:
@@ -123,7 +151,7 @@ async def telephone_translate_helper(text: str, rounds: int, return_language: st
     current_lang = "auto"
     
     async with httpx.AsyncClient() as client:
-        # Perform rounds - 1 intermediate random translations
+        # Perform rounds - 1 intermediate translations
         for i in range(rounds - 1):
             choices = [l for l in LANGUAGES if l != current_lang and l != return_language]
             if not choices:
@@ -134,7 +162,7 @@ async def telephone_translate_helper(text: str, rounds: int, return_language: st
             current_lang = next_lang
             await asyncio.sleep(0.05) # Polite delay
             
-        # Final round to return language
+        # Final round back to return_language
         current_text = await translate_once(client, current_text, current_lang, return_language)
         
     # Restore quotes if applicable
@@ -156,9 +184,6 @@ def format_text_helper(
     indent_paragraphs: bool,
     fix_spelling: bool
 ) -> str:
-    """
-    Formats text by removing double spaces, converting quotes, indenting, and correcting spelling.
-    """
     # 1. Remove double spaces
     if remove_double_spaces:
         text = re.sub(r' {2,}', ' ', text)
@@ -186,7 +211,6 @@ def format_text_helper(
         lines = text.split('\n')
         formatted_lines = []
         for idx, line in enumerate(lines):
-            # Indent if first line of text or if preceded by an empty line
             if idx == 0 and line.strip():
                 formatted_lines.append("    " + line)
             elif idx > 0 and line.strip() and not lines[idx-1].strip():
@@ -198,243 +222,73 @@ def format_text_helper(
     return text
 
 # -----------------------------------------------------------------------------
-# Endpoints
+# Exposing MCP Tools
 # -----------------------------------------------------------------------------
-@app.get("/")
-async def health_check():
+@mcp.tool()
+async def telephone_translate(
+    text: str,
+    rounds: int = 8,
+    return_language: str = "en",
+    preserve_quotes: bool = True
+) -> str:
     """
-    Unprotected health and status check endpoint.
+    Send text through multiple random translation steps to deliberately distort/mangle it before returning the final translation.
+
+    Args:
+        text: The text to translate.
+        rounds: Number of translation rounds (default: 8, clamp 5..50).
+        return_language: Final target language (default: en).
+        preserve_quotes: Whether to preserve double-quoted text using placeholders.
     """
-    return {
+    clamped_rounds = max(5, min(50, rounds))
+    return await telephone_translate_helper(
+        text=text,
+        rounds=clamped_rounds,
+        return_language=return_language,
+        preserve_quotes=preserve_quotes
+    )
+
+@mcp.tool()
+def format_text(
+    text: str,
+    remove_double_spaces: bool = True,
+    straighten_quotes: bool = False,
+    indent_paragraphs: bool = False,
+    fix_spelling: bool = False
+) -> str:
+    """
+    Format text by removing extra spaces, converting quotes, indenting paragraphs, and fixing common spelling mistakes.
+
+    Args:
+        text: The text to format.
+        remove_double_spaces: Remove extra spaces.
+        straighten_quotes: Convert curly quotes to straight quotes.
+        indent_paragraphs: Indent paragraphs with 4 spaces.
+        fix_spelling: Fix common spelling errors.
+    """
+    return format_text_helper(
+        text=text,
+        remove_double_spaces=remove_double_spaces,
+        straighten_quotes=straighten_quotes,
+        indent_paragraphs=indent_paragraphs,
+        fix_spelling=fix_spelling
+    )
+
+# -----------------------------------------------------------------------------
+# Streamable HTTP App Exposure & Health Check Route
+# -----------------------------------------------------------------------------
+# Create the official Streamable HTTP Starlette ASGI application
+base_app = mcp.streamable_http_app()
+
+# Register health check route at root / on the base application
+async def health(request):
+    return JSONResponse({
         "status": "healthy",
         "service": "Telephone Translator Remote MCP Server",
         "version": "1.0.0"
-    }
+    })
 
-@app.post("/mcp")
-async def handle_mcp(request: Request):
-    """
-    Protected MCP endpoint. Uses Authorization: Bearer token auth.
-    Supports tools/list and tools/call.
-    """
-    # Verify auth
-    auth_header = request.headers.get("Authorization")
-    await verify_auth(auth_header)
-    
-    # Parse JSON body
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid JSON payload"
-        )
-    
-    method = payload.get("method")
-    req_id = payload.get("id")
-    
-    if not method:
-        return {
-            "jsonrpc": "2.0",
-            "error": {
-                "code": -32600,
-                "message": "Invalid request: 'method' is required"
-            },
-            "id": req_id
-        }
-        
-    if method == "tools/list":
-        return {
-            "jsonrpc": "2.0",
-            "result": {
-                "tools": [
-                    {
-                        "name": "telephone_translate",
-                        "description": "Send text through multiple random translation steps to deliberately distort/mangle it before returning the final translation.",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "text": {
-                                    "type": "string",
-                                    "description": "The text to translate"
-                                },
-                                "rounds": {
-                                    "type": "integer",
-                                    "description": "Number of translation rounds (default: 8, clamp 5..50)",
-                                    "default": 8
-                                },
-                                "return_language": {
-                                    "type": "string",
-                                    "description": "Final target language (default: en)",
-                                    "default": "en"
-                                },
-                                "preserve_quotes": {
-                                    "type": "boolean",
-                                    "description": "Whether to preserve double-quoted text using placeholders",
-                                    "default": True
-                                }
-                            },
-                            "required": ["text"]
-                        }
-                    },
-                    {
-                        "name": "format_text",
-                        "description": "Format text by removing extra spaces, converting quotes, indenting paragraphs, and fixing common spelling mistakes.",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "text": {
-                                    "type": "string",
-                                    "description": "The text to format"
-                                },
-                                "remove_double_spaces": {
-                                    "type": "boolean",
-                                    "description": "Whether to remove extra spaces (default: true)",
-                                    "default": True
-                                },
-                                "straighten_quotes": {
-                                    "type": "boolean",
-                                    "description": "Whether to convert curly quotes to straight quotes (default: false)",
-                                    "default": False
-                                },
-                                "indent_paragraphs": {
-                                    "type": "boolean",
-                                    "description": "Whether to indent paragraphs with 4 spaces (default: false)",
-                                    "default": False
-                                },
-                                "fix_spelling": {
-                                    "type": "boolean",
-                                    "description": "Whether to fix common spelling mistakes (default: false)",
-                                    "default": False
-                                }
-                            },
-                            "required": ["text"]
-                        }
-                    }
-                ]
-            },
-            "id": req_id
-        }
-        
-    elif method == "tools/call":
-        params = payload.get("params", {})
-        tool_name = params.get("name")
-        arguments = params.get("arguments", {})
-        
-        if not tool_name:
-            return {
-                "jsonrpc": "2.0",
-                "error": {
-                    "code": -32602,
-                    "message": "Invalid parameters: 'name' is required under 'params'"
-                },
-                "id": req_id
-            }
-            
-        if tool_name == "telephone_translate":
-            text = arguments.get("text")
-            if text is None:
-                return {
-                    "jsonrpc": "2.0",
-                    "error": {
-                        "code": -32602,
-                        "message": "Invalid parameters: 'text' is required"
-                    },
-                    "id": req_id
-                }
-                
-            rounds = arguments.get("rounds", 8)
-            try:
-                rounds = int(rounds)
-            except (ValueError, TypeError):
-                rounds = 8
-            rounds = max(5, min(50, rounds))
-            
-            return_language = arguments.get("return_language", "en")
-            preserve_quotes = arguments.get("preserve_quotes", True)
-            if not isinstance(preserve_quotes, bool):
-                preserve_quotes = True
-                
-            translated_res = await telephone_translate_helper(
-                text=text,
-                rounds=rounds,
-                return_language=return_language,
-                preserve_quotes=preserve_quotes
-            )
-            
-            return {
-                "jsonrpc": "2.0",
-                "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": translated_res
-                        }
-                    ]
-                },
-                "id": req_id
-            }
-            
-        elif tool_name == "format_text":
-            text = arguments.get("text")
-            if text is None:
-                return {
-                    "jsonrpc": "2.0",
-                    "error": {
-                        "code": -32602,
-                        "message": "Invalid parameters: 'text' is required"
-                    },
-                    "id": req_id
-                }
-                
-            remove_double_spaces = arguments.get("remove_double_spaces", True)
-            straighten_quotes = arguments.get("straighten_quotes", False)
-            indent_paragraphs = arguments.get("indent_paragraphs", False)
-            fix_spelling_opt = arguments.get("fix_spelling", False)
-            
-            # Coerce inputs to booleans if they aren't
-            remove_double_spaces = remove_double_spaces if isinstance(remove_double_spaces, bool) else True
-            straighten_quotes = straighten_quotes if isinstance(straighten_quotes, bool) else False
-            indent_paragraphs = indent_paragraphs if isinstance(indent_paragraphs, bool) else False
-            fix_spelling_opt = fix_spelling_opt if isinstance(fix_spelling_opt, bool) else False
-            
-            formatted_res = format_text_helper(
-                text=text,
-                remove_double_spaces=remove_double_spaces,
-                straighten_quotes=straighten_quotes,
-                indent_paragraphs=indent_paragraphs,
-                fix_spelling=fix_spelling_opt
-            )
-            
-            return {
-                "jsonrpc": "2.0",
-                "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": formatted_res
-                        }
-                    ]
-                },
-                "id": req_id
-            }
-            
-        else:
-            return {
-                "jsonrpc": "2.0",
-                "error": {
-                    "code": -32601,
-                    "message": f"Tool not found: {tool_name}"
-                },
-                "id": req_id
-            }
-            
-    else:
-        return {
-            "jsonrpc": "2.0",
-            "error": {
-                "code": -32601,
-                "message": f"Method not found: {method}"
-            },
-            "id": req_id
-        }
+base_app.add_route("/", health, methods=["GET"])
+
+# Wrap with our custom security middleware to protect all /mcp endpoints
+app = BearerAuthASGIMiddleware(base_app)
